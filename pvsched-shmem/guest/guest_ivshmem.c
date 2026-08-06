@@ -10,6 +10,8 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/mutex.h>
+#include <linux/rcupdate.h>
 
 /*
  * pvsched.h is the common header shared by kernel modules, eBPF programs,
@@ -90,28 +92,39 @@ struct guest_ivshmem_device {
 /*
  * We assume that the VM contains exactly one ivshmem-plain device. probe()
  * should publish its initialized state here before the module registers
- * the kfunc. We also assume that the device remains bound as long as the VM is
- * running and hence also during the lifetime of guest pvsched-ebpf component
- * that calls the kfunc.
+ * the kfunc.
+ * Updates to the device are serialized by guest_ivshmem_lock.
+ * Kfunc callers access the published device under rcu_read_lock().
  */
-static struct guest_ivshmem_device *guest_ivshmem;
+static DEFINE_MUTEX(guest_ivshmem_lock);
+static struct guest_ivshmem_device __rcu *guest_ivshmem;
 
 static int guest_ivshmem_g2h_write_msg(
 	u32 index, const struct gh_message *gh_msg)
 {
 	struct guest_ivshmem_device *guest;
 	struct gh_message __iomem *slot;
-
-	guest = READ_ONCE(guest_ivshmem);
-
-	if (!guest || !guest->g2h_page)
-		return -ENODEV;
+	int ret = 0;
 
 	if (!gh_msg)
 		return -EINVAL;
 
 	if (index >= NR_GUEST_IVSHMEM_MSGS)
 		return -EINVAL;
+
+	rcu_read_lock();
+
+	guest = rcu_dereference(guest_ivshmem);
+
+	if (!guest) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	if (WARN_ON_ONCE(!guest->g2h_page)) {
+		ret = -EIO;
+		goto out_unlock;
+	}
 
 	slot = (struct gh_message __iomem *)
 		(guest->g2h_page + index * GUEST_IVSHMEM_MSG_SIZE);
@@ -124,7 +137,10 @@ static int guest_ivshmem_g2h_write_msg(
 	 */
   writeq(gh_msg->msg, &slot->msg);
 
-	return 0;
+out_unlock:
+	rcu_read_unlock();
+
+	return ret;
 }
 
 PVSCHED_KFUNC_DEFS_START();
@@ -264,7 +280,10 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 	 * Remember! That we assume the VM contains exactly one ivshmem-plain device.
    * So reject an unexpected second device.
 	 */
-	if (READ_ONCE(guest_ivshmem)) {
+	mutex_lock(&guest_ivshmem_lock);
+
+	if (rcu_access_pointer(guest_ivshmem)) {
+		mutex_unlock(&guest_ivshmem_lock);
 		dev_err(&pdev->dev,
 			GUEST_IVSHMEM_NAME
 			": only one ivshmem device is supported\n");
@@ -275,7 +294,8 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 	/* Make the per-device state available for the remove callback. */
 	pci_set_drvdata(pdev, guest);
 
-  WRITE_ONCE(guest_ivshmem, guest);
+  rcu_assign_pointer(guest_ivshmem, guest);
+	mutex_unlock(&guest_ivshmem_lock);
 
 	dev_info(&pdev->dev, GUEST_IVSHMEM_NAME ": successfully mapped BAR%d G2H page: offset %lu, size %lu, %zu messages\n",
 		 GUEST_IVSHMEM_BAR, GUEST_IVSHMEM_G2H_OFFSET,
@@ -297,7 +317,9 @@ err_free_guest:
 
 static void guest_ivshmem_remove(struct pci_dev *pdev)
 {
-	struct guest_ivshmem_device *guest = pci_get_drvdata(pdev);
+	struct guest_ivshmem_device *guest, *tmp;
+
+	guest = pci_get_drvdata(pdev);
 
 	if (!guest) {
     pr_err(GUEST_IVSHMEM_NAME ": remove() called with no guest_ivshmem_device state!\n");
@@ -305,8 +327,17 @@ static void guest_ivshmem_remove(struct pci_dev *pdev)
   }
 
 	pci_set_drvdata(pdev, NULL);
-	WARN_ON_ONCE(READ_ONCE(guest_ivshmem) != guest);
-  WRITE_ONCE(guest_ivshmem, NULL);
+	mutex_lock(&guest_ivshmem_lock);
+	tmp = rcu_access_pointer(guest_ivshmem);
+
+	if (WARN_ON_ONCE(tmp != guest))
+		goto out_unlock;
+
+	rcu_assign_pointer(guest_ivshmem, NULL);
+
+out_unlock:
+	mutex_unlock(&guest_ivshmem_lock);
+	synchronize_rcu();
 	pci_iounmap(pdev, guest->g2h_page);
 	pci_release_region(pdev, GUEST_IVSHMEM_BAR);
 	pci_disable_device(pdev);
@@ -359,7 +390,7 @@ static int __init guest_ivshmem_init(void)
 		return ret;
 	}
 
-	if (!READ_ONCE(guest_ivshmem)) {
+	if (!rcu_access_pointer(guest_ivshmem)) {
 		pr_err(GUEST_IVSHMEM_NAME
 		       ": no compatible ivshmem device was found\n");
 		ret = -ENODEV;
