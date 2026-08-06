@@ -354,6 +354,11 @@ static int __init guest_ivshmem_init(void)
    */
 	ret = pci_register_driver(&guest_ivshmem_driver);
 
+	if (ret) {
+		pr_err(GUEST_IVSHMEM_NAME ": failed to register PCI driver: %d\n", ret);
+		return ret;
+	}
+
 	if (!READ_ONCE(guest_ivshmem)) {
 		pr_err(GUEST_IVSHMEM_NAME
 		       ": no compatible ivshmem device was found\n");
