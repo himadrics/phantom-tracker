@@ -28,7 +28,7 @@ typedef __UINT64_TYPE__ pvsched_u64;
 #else
 
 #include <stdint.h>
-typedef uint64_t pvsched_u64;
+
 
 #endif /* Kernel || eBPF || Userspace */
 

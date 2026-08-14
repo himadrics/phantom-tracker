@@ -2,14 +2,19 @@
  *
  * Contributors:
  *   Human: Himadri Chhaya-Shailesh
+ *   Human: Nchang Roy Fru
  *   AI: ChatGPT-5.6
  */
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 /*
  * pvsched.h is the common header shared by kernel modules, eBPF programs,
@@ -52,6 +57,8 @@
 #define GUEST_IVSHMEM_SIZE (2 * PVSCHED_IVSHMEM_PAGE_SIZE)
 #define GUEST_IVSHMEM_G2H_SIZE PVSCHED_IVSHMEM_PAGE_SIZE
 #define GUEST_IVSHMEM_G2H_OFFSET PVSCHED_IVSHMEM_PAGE_SIZE
+#define GUEST_IVSHMEM_H2G_SIZE PVSCHED_IVSHMEM_PAGE_SIZE
+#define GUEST_IVSHMEM_H2G_OFFSET 0UL
 
 /*
  * QEMU exposes an ivshmem-plain device to the guest as a PCI device. Hence,
@@ -76,6 +83,10 @@
  * through the appropriate kernel I/O accessors rather than ordinary pointer
  * dereferences or memcpy().
  *
+ * @h2g_page: Kernel virtual address of the host-to-guest page in BAR2.
+ * 
+ * @cdev: Character device to which this driver is bound.
+ *
  * @size: Total size of BAR2, in bytes, as reported by the PCI subsystem.
  * PCI resource addresses and lengths may be wider than int or unsigned
  * long on some architectures, such as ARM. Hence, we use resource_size_t
@@ -84,6 +95,8 @@
 struct guest_ivshmem_device {
 	struct pci_dev *pdev;
 	u8 __iomem *g2h_page;
+	u8 __iomem *h2g_page;
+	struct cdev cdev;
 	resource_size_t size;
 };
 
@@ -95,6 +108,152 @@ struct guest_ivshmem_device {
  * that calls the kfunc.
  */
 static struct guest_ivshmem_device *guest_ivshmem;
+
+/*
+	Holds device number for the char device
+*/
+static dev_t guest_ivshmem_devt;
+
+/*
+	sysfs class for the char device
+*/
+static struct class *guest_ivshmem_class;
+
+
+static int guest_ivshmem_open(struct inode *inode, struct file *file)
+{
+	file->private_data = guest_ivshmem;
+	return 0;
+}
+
+static int guest_ivshmem_release(struct inode *inode, struct file *file)
+{
+	file->private_data = NULL;
+	return 0;
+}
+
+/*
+ * offset is treated as a slot index (0..NR_HOST_IVSHMEM_MSGS-1), not a byte
+ * offset, and is never advanced by this function -- the caller picks the
+ * slot to read on every call (e.g. via pread() or lseek()+read()). Slot
+ * H2G_LATEST_SLOT always holds the most recently published message; see
+ * pvsched.h for the full slot ABI.
+ */
+static ssize_t guest_ivshmem_read(struct file *file, char __user *buf,
+				   size_t size, loff_t *offset)
+{
+	struct guest_ivshmem_device *guest = file->private_data;
+	struct hg_message __iomem *slot;
+	struct hg_message msg = {};
+
+	if (!guest || !guest->h2g_page)
+		return -ENODEV;
+
+	if (size < sizeof(msg))
+		return -EINVAL;
+
+	if (*offset < 0 || *offset >= NR_HOST_IVSHMEM_MSGS)
+		return 0;
+
+	slot = (struct hg_message __iomem *)
+		(guest->h2g_page + (*offset) * HOST_IVSHMEM_MSG_SIZE);
+
+	/*
+	 * slot is __iomem: it must be read through an I/O accessor rather
+	 * than a plain pointer dereference or memcpy() (see the @g2h_page
+	 * doc comment above for why), so copy it into a kernel-stack buffer
+	 * first and only then hand it to copy_to_user().
+	 */
+	memcpy_fromio(&msg, slot, sizeof(msg));
+
+	if (copy_to_user(buf, &msg, sizeof(msg)))
+		return -EFAULT;
+
+	return sizeof(msg);
+}
+
+/*
+	file operations for the char device
+	
+*/
+
+static struct file_operations guest_ivshmem_fops ={
+	.owner = THIS_MODULE,
+	.open = guest_ivshmem_open,
+	.release = guest_ivshmem_release,
+	.read = guest_ivshmem_read,
+};
+
+
+/*
+ * Must be called after guest_ivshmem is populated by probe() -- cdev_init()
+ * cdev_add() below bind to &guest_ivshmem->cdev, which doesn't exist yet
+ * before that.
+ */
+static int guest_ivshmem_register_chardev(void)
+{
+	struct device *dev;
+	int ret;
+
+	ret = alloc_chrdev_region(&guest_ivshmem_devt, 0, 1, GUEST_IVSHMEM_NAME);
+	if (ret < 0) {
+		pr_err(GUEST_IVSHMEM_NAME ": failed to allocate chrdev region: %d\n", ret);
+		return ret;
+	}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+	guest_ivshmem_class = class_create(THIS_MODULE, GUEST_IVSHMEM_NAME);
+#else
+	guest_ivshmem_class = class_create(GUEST_IVSHMEM_NAME);
+#endif
+	if (IS_ERR(guest_ivshmem_class)) {
+		ret = PTR_ERR(guest_ivshmem_class);
+		guest_ivshmem_class = NULL;
+		pr_err(GUEST_IVSHMEM_NAME ": failed to create class: %d\n", ret);
+		goto err_unregister_chrdev;
+	}
+
+	cdev_init(&guest_ivshmem->cdev, &guest_ivshmem_fops);
+	guest_ivshmem->cdev.owner = THIS_MODULE;
+
+	ret = cdev_add(&guest_ivshmem->cdev, guest_ivshmem_devt, 1);
+	if (ret < 0) {
+		pr_err(GUEST_IVSHMEM_NAME ": failed to add chrdev: %d\n", ret);
+		goto err_destroy_class;
+	}
+
+	dev = device_create(guest_ivshmem_class, NULL, guest_ivshmem_devt, NULL,
+			    GUEST_IVSHMEM_NAME);
+	if (IS_ERR(dev)) {
+		ret = PTR_ERR(dev);
+		pr_err(GUEST_IVSHMEM_NAME ": failed to create device: %d\n", ret);
+		goto err_del_cdev;
+	}
+
+	pr_info(GUEST_IVSHMEM_NAME ": created /dev/%s\n", GUEST_IVSHMEM_NAME);
+	return 0;
+
+err_del_cdev:
+	cdev_del(&guest_ivshmem->cdev);
+err_destroy_class:
+	class_destroy(guest_ivshmem_class);
+	guest_ivshmem_class = NULL;
+err_unregister_chrdev:
+	unregister_chrdev_region(guest_ivshmem_devt, 1);
+	return ret;
+}
+
+static void guest_ivshmem_unregister_chardev(void)
+{
+	if (!guest_ivshmem_class)
+		return;
+
+	device_destroy(guest_ivshmem_class, guest_ivshmem_devt);
+	cdev_del(&guest_ivshmem->cdev);
+	class_destroy(guest_ivshmem_class);
+	guest_ivshmem_class = NULL;
+	unregister_chrdev_region(guest_ivshmem_devt, 1);
+}
 
 static int guest_ivshmem_g2h_write_msg(
 	u32 index, const struct gh_message *gh_msg)
@@ -261,6 +420,20 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 	guest->size = size;
 
 	/*
+	 * Map page 0 of BAR2 (host-to-guest messages) so guest userspace can
+	 * read it through the character device.
+	 */
+	guest->h2g_page = pci_iomap_range(pdev, GUEST_IVSHMEM_BAR, GUEST_IVSHMEM_H2G_OFFSET,
+		GUEST_IVSHMEM_H2G_SIZE);
+
+	if (!guest->h2g_page) {
+		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": failed to map the H2G page in BAR%d\n",
+			GUEST_IVSHMEM_BAR);
+		ret = -ENOMEM;
+		goto err_unmap_g2h;
+	}
+
+	/*
 	 * Remember! That we assume the VM contains exactly one ivshmem-plain device.
    * So reject an unexpected second device.
 	 */
@@ -269,7 +442,7 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 			GUEST_IVSHMEM_NAME
 			": only one ivshmem device is supported\n");
 		ret = -EBUSY;
-		goto err_unmap_g2h;
+		goto err_unmap_h2g;
 	}
 
 	/* Make the per-device state available for the remove callback. */
@@ -284,6 +457,8 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 
 	return 0;
 
+err_unmap_h2g:
+	pci_iounmap(pdev, guest->h2g_page);
 err_unmap_g2h:
 	pci_iounmap(pdev, guest->g2h_page);
 err_release_region:
@@ -307,12 +482,13 @@ static void guest_ivshmem_remove(struct pci_dev *pdev)
 	pci_set_drvdata(pdev, NULL);
 	WARN_ON_ONCE(READ_ONCE(guest_ivshmem) != guest);
   WRITE_ONCE(guest_ivshmem, NULL);
+	pci_iounmap(pdev, guest->h2g_page);
 	pci_iounmap(pdev, guest->g2h_page);
 	pci_release_region(pdev, GUEST_IVSHMEM_BAR);
 	pci_disable_device(pdev);
 	kfree(guest);
 
-	dev_info(&pdev->dev, GUEST_IVSHMEM_NAME ": unmapped BAR%d G2H page\n", GUEST_IVSHMEM_BAR);
+	dev_info(&pdev->dev, GUEST_IVSHMEM_NAME ": unmapped BAR%d G2H/H2G pages\n", GUEST_IVSHMEM_BAR);
 }
 
 /*
@@ -324,6 +500,7 @@ static void guest_ivshmem_remove(struct pci_dev *pdev)
  * the device is unbound, removed, or the driver is unregistered. @name
  * identifies the driver in places such as sysfs and kernel messages.
  */
+
 static struct pci_driver guest_ivshmem_driver = {
   .driver = {
     .suppress_bind_attrs = true,
@@ -369,6 +546,14 @@ static int __init guest_ivshmem_init(void)
 		goto err_unregister_pci_driver;
 	}
 
+	ret = guest_ivshmem_register_chardev();
+
+	if (ret) {
+		pr_err(GUEST_IVSHMEM_NAME
+		       ": failed to register chardev: %d\n", ret);
+		goto err_unregister_pci_driver;
+	}
+
 	if (ret) {
 		pr_err(GUEST_IVSHMEM_NAME ": failed to register PCI driver: %d\n", ret);
     goto err_unregister_pci_driver;
@@ -385,6 +570,12 @@ err_unregister_pci_driver:
 
 static void __exit guest_ivshmem_exit(void)
 {
+	/*
+	 * Tear down the chardev first: it points at &guest_ivshmem->cdev,
+	 * and pci_unregister_driver() below is what frees that struct via
+	 * remove().
+	 */
+	guest_ivshmem_unregister_chardev();
 	/* pci_unregister_driver() invokes remove() for every bound device. */
 	pci_unregister_driver(&guest_ivshmem_driver);
 	pr_info(GUEST_IVSHMEM_NAME ": unloaded the PCI driver\n");

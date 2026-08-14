@@ -23,19 +23,19 @@ default: check_btf
 	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) modules
 
 check_btf:
-  @test -e "$(KERNEL_VMLINUX)" || { \
-    echo "error: $(KERNEL_VMLINUX) is missing"; \
-    echo "run: sudo make prepare_btf"; \
-    exit 1; \
-  }
+	@test -e "$(KERNEL_VMLINUX)" || { \
+	  echo "error: $(KERNEL_VMLINUX) is missing"; \
+	  echo "run: sudo make prepare_btf"; \
+	  exit 1; \
+	}
 
 prepare_btf:
-  @test -r "$(BTF_BASE)" || { \
-    echo "error: base BTF not found at $(BTF_BASE)"; \
-    exit 1; \
-  }
-  ln -sfn "$(BTF_BASE)" "$(KERNEL_VMLINUX)"
-  @echo "Linked $(KERNEL_VMLINUX) -> $(BTF_BASE)"
+	@test -r "$(BTF_BASE)" || { \
+	  echo "error: base BTF not found at $(BTF_BASE)"; \
+	  exit 1; \
+	}
+	ln -sfn "$(BTF_BASE)" "$(KERNEL_VMLINUX)"
+	@echo "Linked $(KERNEL_VMLINUX) -> $(BTF_BASE)"
 
 modules_install:
 	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) modules_install

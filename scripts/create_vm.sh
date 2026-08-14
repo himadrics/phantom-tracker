@@ -114,7 +114,25 @@ if [[ "$ARG_TYPE" == "target" ]]; then
         fi
     }
 
-    trap cleanup_target_pvsched_shmem EXIT
+    cleanup_target_pvsched_ebpf() {
+        echo "Cleaning up BPF maps and registry for VM: $ARG_NAME"
+        local pvsched_ebpf_host
+        pvsched_ebpf_host="$(cd "$(dirname "${BASH_SOURCE[0]}")/../pvsched-ebpf/host" && pwd)"
+        if [[ -x "$pvsched_ebpf_host/bin/cleanup" ]]; then
+            sudo "$pvsched_ebpf_host/bin/cleanup" "$ARG_NAME" || true
+        fi
+
+        echo "Stopping background VM monitoring loaders..."
+        sudo pkill -f timer.loader || true
+        sudo pkill -f h2g_msg_timer_loader || true
+    }
+
+    cleanup_all() {
+        cleanup_target_pvsched_shmem
+        cleanup_target_pvsched_ebpf
+    }
+
+    trap cleanup_all EXIT
 fi
 
 IVSHMEM_QEMU_ARGS=()
@@ -178,7 +196,7 @@ else
     SSH_PUBKEY_STR="$(cat "$ARG_SSH_PUBKEY")"
     cloudinit_fetch_base_image "$ARG_BASE_IMAGE"
     cloudinit_create_overlay   "$ARG_BASE_IMAGE" "$DISK_IMG" "$ARG_DISK_SIZE"
-    cloudinit_make_iso         "$SEED_ISO" "$ARG_NAME" "$SSH_PUBKEY_STR" "$ARG_PASSWORD"
+    cloudinit_make_iso         "$SEED_ISO" "$ARG_NAME" "$SSH_PUBKEY_STR" "$ARG_PASSWORD" "$ARG_TYPE"
     SEED_ISO_ARG=(-drive "file=$SEED_ISO,format=raw,if=virtio,readonly=on")
 fi
 
@@ -187,6 +205,12 @@ TOTAL_VCPUS=$(( ARG_SOCKETS * ARG_CORES * ARG_THREADS ))
 CPU_TOPOLOGY="$TOTAL_VCPUS,sockets=$ARG_SOCKETS,cores=$ARG_CORES,threads=$ARG_THREADS"
 
 # --- QEMU command ---
+
+
+#--vm qmp socket definition ----
+QMP_SOCKET="/tmp/${ARG_NAME}-qmp.sock"
+rm -f "$QMP_SOCKET"
+
 QEMU_CMD=(
     qemu-system-x86_64
     -enable-kvm
@@ -200,6 +224,7 @@ QEMU_CMD=(
     -net nic,model=virtio
     -net "user,hostfwd=tcp::${ARG_SSH_PORT}-:22"
     -nographic
+    -qmp "unix:${QMP_SOCKET},server,nowait"
 )
 
 if [[ "$ARG_ADD_VSOCK" == "true" ]]; then
@@ -239,7 +264,27 @@ fi
 echo "starting in 10 seconds..." # Sleep before starting to give the user a chance to read the output and cancel if something looks wrong
 sleep 10
 set +e
-"${QEMU_CMD[@]}"
+"${QEMU_CMD[@]}" &
+qemu_pid=$!
+
+# Wait for QEMU to create the QMP socket before registering the VM
+echo "waiting for QMP socket at $QMP_SOCKET..."
+for i in $(seq 1 30); do
+    if [[ -S "$QMP_SOCKET" ]]; then
+        echo "QMP socket ready"
+        break
+    fi
+    sleep 1
+done
+
+if [[ -S "$QMP_SOCKET" && "$ARG_TYPE" == "target" ]]; then
+    bash "$(dirname "$0")/lib/register_vm.sh" --socket="$QMP_SOCKET" --name="$ARG_NAME" --nb-vcpus="$TOTAL_VCPUS"
+else
+    echo "warning: QMP socket never appeared, skipping VM registration" >&2
+fi
+
+wait "$qemu_pid"
 qemu_rc=$?
+rm -f "$QMP_SOCKET"
 set -e
 exit "$qemu_rc"
