@@ -84,13 +84,18 @@
  * dereferences or memcpy().
  *
  * @h2g_page: Kernel virtual address of the host-to-guest page in BAR2.
- * 
+ *
  * @cdev: Character device to which this driver is bound.
  *
  * @size: Total size of BAR2, in bytes, as reported by the PCI subsystem.
  * PCI resource addresses and lengths may be wider than int or unsigned
  * long on some architectures, such as ARM. Hence, we use resource_size_t
  * to ensure that the size is represented correctly on all architectures.
+ *
+ * @metadata_phy_page: Physical address of the metadata page in BAR2.
+ * Userspace mmaps this together with the H2G page (metadata followed by
+ * H2G, in series) so it can read both the header and the latest message
+ * with a single mapping.
  */
 struct guest_ivshmem_device {
 	struct pci_dev *pdev;
@@ -99,6 +104,7 @@ struct guest_ivshmem_device {
 	resource_size_t size;
 	resource_size_t h2g_phy_page;
 	resource_size_t h2g_page_size;
+	resource_size_t metadata_phy_page;
 };
 
 /*
@@ -135,19 +141,27 @@ static int guest_ivshmem_release(struct inode *inode, struct file *file)
 
 /*
  * params:
-	file: struct file: 
+	file: struct file:
 	vm_area: struct vm_area_struct
-	objective: a file operation to permit userspace programs to direclty map host_to_guest page in userspace memory and read phantom average
-			  lower overhead
+	objective: a file operation to permit userspace programs to directly map
+			  the metadata page and the host_to_guest page, in series, into
+			  userspace memory and read the phantom average with lower
+			  overhead. The metadata page lands at offset 0 of the mapping
+			  and the H2G page immediately follows it.
  */
 int  guest_ivshmem_mmap(struct file * file, struct vm_area_struct * vma)
 {
 	struct guest_ivshmem_device *guest = file->private_data;
+	resource_size_t total_size = GUEST_IVSHMEM_METADATA_SIZE + guest->h2g_page_size;
 	int status;
+
+	if (vma->vm_pgoff != 0 || vma_pages(vma) * PAGE_SIZE != total_size)
+		return -EINVAL;
+
 	status  = remap_pfn_range(vma,
 							  vma->vm_start,
-							  guest->h2g_phy_page >> PAGE_SHIFT,
-							  guest->h2g_page_size,
+							  guest->metadata_phy_page >> PAGE_SHIFT,
+							  total_size,
 							  vma->vm_page_prot);
 	return status;
 }
@@ -412,6 +426,20 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 		goto err_release_region;
 	}
 
+	/*
+	 * guest_ivshmem_mmap() maps the metadata page and the H2G page in a
+	 * single, contiguous mapping (metadata first, H2G immediately after)
+	 * so userspace can reach both with one mmap(). That's only valid if
+	 * the host actually laid them out back-to-back.
+	 */
+	if (hdr.h2g_page_offset != GUEST_IVSHMEM_METADATA_OFFSET + GUEST_IVSHMEM_METADATA_SIZE) {
+		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": H2G page (offset=%llu) is not immediately after the metadata page (offset=%llu size=%llu)\n",
+			hdr.h2g_page_offset, (unsigned long long)GUEST_IVSHMEM_METADATA_OFFSET,
+			(unsigned long long)GUEST_IVSHMEM_METADATA_SIZE);
+		ret = -EINVAL;
+		goto err_release_region;
+	}
+
 	if (size < hdr.g2h_page_offset + hdr.g2h_page_size) {
 		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": BAR%d (%llu bytes) is smaller than the G2H region described by the metadata header (offset=%llu size=%llu)\n",
 			GUEST_IVSHMEM_BAR, (unsigned long long)size,
@@ -439,8 +467,9 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 	guest->size = size;
 
 	/*
-	 * Get physical address of h2g page
+	 * Get physical addresses of the metadata and h2g pages.
 	 */
+	guest->metadata_phy_page = pci_resource_start(pdev, GUEST_IVSHMEM_BAR) + GUEST_IVSHMEM_METADATA_OFFSET;
 	guest->h2g_phy_page = pci_resource_start(pdev, GUEST_IVSHMEM_BAR) + hdr.h2g_page_offset;
 	guest->h2g_page_size = hdr.h2g_page_size;
 
