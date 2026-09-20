@@ -25,6 +25,7 @@
  */
 #define PVSCHED_IVSHMEM_PAGE_SIZE PAGE_SIZE
 #include "pvsched.h"
+#include "pvsched_shmem.h"
 #include "ebpf_compatibility.h"
 
 /* grep for the following string in dmesg for debugging */
@@ -40,26 +41,24 @@
 #define GUEST_IVSHMEM_BAR 2
 
 /*
- * The current implementation of pvshed-shmem allocates exactly two pages on
- * the host, which are exposed to the guest via BAR2 of the ivshmem-plain
- * device.
+ * The host (host_ivshmem.c) lays out each per-VM backend as:
+ *   page 0: metadata (struct ivshmem_header), describing where the
+ *           H2G and G2H regions actually live and how big they are.
+ *   page 1: host-to-guest messages (struct hg_message)
+ *           - exclusively written by the host and read by the guest userspace
+ *           - NOT mapped by this driver to prevent accidental modification
+ *             by the guest
+ *   page 2..N: guest-to-host messages (struct gh_message)
+ *           - exclusively written by the guest and read by the host
+ *           - mapped by this driver to write the guest messages using a kfunc
  *
- * page 0:
- * - host-to-guest messages (struct hg_message)
- * - exclusively written by the host and read by the guest userspace
- * - NOT mapped by this driver to prevent accidental modification by the guest
- * 
- * page 1:
- * - guest-to-host messages (struct gh_message)
- * - exclusively written by the guest and read by the host
- * - mapped by this driver to write the guest messages using a kfunc
- *
+ * The H2G/G2H offsets and sizes are NOT hardcoded here: they are read at
+ * probe() time from the metadata page, so this driver stays correct even
+ * if the host's layout changes, and doesn't need to be kept in sync with
+ * host_ivshmem.c by hand.
  */
-#define GUEST_IVSHMEM_SIZE (2 * PVSCHED_IVSHMEM_PAGE_SIZE)
-#define GUEST_IVSHMEM_G2H_SIZE PVSCHED_IVSHMEM_PAGE_SIZE
-#define GUEST_IVSHMEM_G2H_OFFSET PVSCHED_IVSHMEM_PAGE_SIZE
-#define GUEST_IVSHMEM_H2G_SIZE PVSCHED_IVSHMEM_PAGE_SIZE
-#define GUEST_IVSHMEM_H2G_OFFSET 0UL
+#define GUEST_IVSHMEM_METADATA_OFFSET 0UL
+#define GUEST_IVSHMEM_METADATA_SIZE PVSCHED_IVSHMEM_PAGE_SIZE
 
 /*
  * QEMU exposes an ivshmem-plain device to the guest as a PCI device. Hence,
@@ -99,6 +98,7 @@ struct guest_ivshmem_device {
 	struct cdev cdev;
 	resource_size_t size;
 	resource_size_t h2g_phy_page;
+	resource_size_t h2g_page_size;
 };
 
 /*
@@ -145,9 +145,9 @@ int  guest_ivshmem_mmap(struct file * file, struct vm_area_struct * vma)
 	struct guest_ivshmem_device *guest = file->private_data;
 	int status;
 	status  = remap_pfn_range(vma,
-							  vma->vm_start, 
+							  vma->vm_start,
 							  guest->h2g_phy_page >> PAGE_SHIFT,
-							  GUEST_IVSHMEM_H2G_SIZE,
+							  guest->h2g_page_size,
 							  vma->vm_page_prot);
 	return status;
 }
@@ -325,6 +325,8 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 			       const struct pci_device_id *id)
 {
 	struct guest_ivshmem_device *guest;
+	struct ivshmem_header hdr;
+	void __iomem *metadata_page;
 	resource_size_t size;
 	unsigned long flags;
 	int ret;
@@ -359,16 +361,15 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 	}
 
   /*
-   * Verify that BAR2 exposes the complete two-page shared-memory layout.
-   * Mapping the G2H page is safe only after confirming that page 1 lies
-   * within the PCI resource provided by the device.
+   * BAR2 must be at least large enough to hold the metadata page before
+   * it can be mapped and read to find out where the H2G/G2H regions
+   * actually are.
    */
   size = pci_resource_len(pdev, GUEST_IVSHMEM_BAR);
 
-	if (size != GUEST_IVSHMEM_SIZE) {
-		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": BAR%d has size %llu bytes; expected %lu bytes\n",
-			GUEST_IVSHMEM_BAR, (unsigned long long)size,
-			GUEST_IVSHMEM_SIZE);
+	if (size < GUEST_IVSHMEM_METADATA_SIZE) {
+		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": BAR%d is too small (%llu bytes) to hold the metadata page\n",
+			GUEST_IVSHMEM_BAR, (unsigned long long)size);
 		ret = -EINVAL;
 		goto err_disable_device;
 	}
@@ -386,12 +387,46 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 		goto err_disable_device;
 	}
 
-  /*
-   * Map only page 1 of BAR2, which is used for guest-to-host messages.
-   * Page 0 is purposefully left unmapped by this driver.
+	/*
+	 * Read the metadata page to find out where the host actually placed
+	 * the H2G and G2H regions, instead of hardcoding the host's layout
+	 * here. Unmapped again immediately after reading it.
 	 */
-	guest->g2h_page = pci_iomap_range(pdev, GUEST_IVSHMEM_BAR, GUEST_IVSHMEM_G2H_OFFSET,
-      GUEST_IVSHMEM_G2H_SIZE);
+	metadata_page = pci_iomap_range(pdev, GUEST_IVSHMEM_BAR,
+					 GUEST_IVSHMEM_METADATA_OFFSET,
+					 GUEST_IVSHMEM_METADATA_SIZE);
+	if (!metadata_page) {
+		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": failed to map the metadata page in BAR%d\n",
+			GUEST_IVSHMEM_BAR);
+		ret = -ENOMEM;
+		goto err_release_region;
+	}
+
+	memcpy_fromio(&hdr, metadata_page, sizeof(hdr));
+	pci_iounmap(pdev, metadata_page);
+
+	if (hdr.magic != PVSCHED_MAGIC || hdr.version != PVSCHED_VERSION) {
+		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": unexpected metadata header (magic=0x%x version=%u)\n",
+			hdr.magic, hdr.version);
+		ret = -EINVAL;
+		goto err_release_region;
+	}
+
+	if (size < hdr.g2h_page_offset + hdr.g2h_page_size) {
+		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": BAR%d (%llu bytes) is smaller than the G2H region described by the metadata header (offset=%llu size=%llu)\n",
+			GUEST_IVSHMEM_BAR, (unsigned long long)size,
+			hdr.g2h_page_offset, hdr.g2h_page_size);
+		ret = -EINVAL;
+		goto err_release_region;
+	}
+
+  /*
+   * Map the G2H region described by the metadata header. The H2G page
+   * is intentionally left unmapped by this driver; only its physical
+   * address is recorded below, for userspace to mmap directly.
+	 */
+	guest->g2h_page = pci_iomap_range(pdev, GUEST_IVSHMEM_BAR, hdr.g2h_page_offset,
+      hdr.g2h_page_size);
 
 	if (!guest->g2h_page) {
 		dev_err(&pdev->dev, GUEST_IVSHMEM_NAME ": failed to map the G2H page in BAR%d\n",
@@ -406,8 +441,8 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 	/*
 	 * Get physical address of h2g page
 	 */
-	
-	guest->h2g_phy_page = pci_resource_start(pdev, GUEST_IVSHMEM_BAR) +	GUEST_IVSHMEM_H2G_OFFSET;
+	guest->h2g_phy_page = pci_resource_start(pdev, GUEST_IVSHMEM_BAR) + hdr.h2g_page_offset;
+	guest->h2g_page_size = hdr.h2g_page_size;
 
 	/*
 	 * Remember! That we assume the VM contains exactly one ivshmem-plain device.
@@ -426,9 +461,9 @@ static int guest_ivshmem_probe(struct pci_dev *pdev,
 
   WRITE_ONCE(guest_ivshmem, guest);
 
-	dev_info(&pdev->dev, GUEST_IVSHMEM_NAME ": successfully mapped BAR%d G2H page: offset %lu, size %lu, %zu messages\n",
-		 GUEST_IVSHMEM_BAR, GUEST_IVSHMEM_G2H_OFFSET,
-		 GUEST_IVSHMEM_G2H_SIZE,
+	dev_info(&pdev->dev, GUEST_IVSHMEM_NAME ": successfully mapped BAR%d G2H page: offset %llu, size %llu, %zu messages\n",
+		 GUEST_IVSHMEM_BAR, hdr.g2h_page_offset,
+		 hdr.g2h_page_size,
  		 (size_t)NR_GUEST_IVSHMEM_MSGS);
 
 	return 0;
