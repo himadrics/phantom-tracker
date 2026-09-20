@@ -135,19 +135,38 @@ if [[ "$ARG_TYPE" == "target" ]]; then
     trap cleanup_all EXIT
 fi
 
+# --- CPU topology ---
+TOTAL_VCPUS=$(( ARG_SOCKETS * ARG_CORES * ARG_THREADS ))
+CPU_TOPOLOGY="$TOTAL_VCPUS,sockets=$ARG_SOCKETS,cores=$ARG_CORES,threads=$ARG_THREADS"
+
 IVSHMEM_QEMU_ARGS=()
 HOSTBACKEND_DEVICE=""
+HOST_REGISTRY_DEVICE="/dev/host_registry"
 if [[ "$ARG_TYPE" == "target" ]]; then
-    HOSTBACKEND_DEVICE="/dev/host_ivshmem0"
-    if grep -qE '^host_ivshmem[[:space:]]' /proc/modules && [[ -e "$HOSTBACKEND_DEVICE" ]]; then
-        IVSHMEM_QEMU_ARGS=(
-            -object "memory-backend-file,id=hostmem0,size=8192,share=on,mem-path=$HOSTBACKEND_DEVICE"
-            -device "ivshmem-plain,memdev=hostmem0"
-        )
-        echo "ivshmem: enabled host-backed shared memory via $HOSTBACKEND_DEVICE"
+    if grep -qE '^host_ivshmem[[:space:]]' /proc/modules && [[ -e "$HOST_REGISTRY_DEVICE" ]]; then
+        REGISTER_VM_BACKEND_DIR="$(dirname "$0")/../pvsched-shmem/host/usr"
+        REGISTER_VM_BACKEND_BIN="$REGISTER_VM_BACKEND_DIR/register_vm_backend"
+
+        make -C "$REGISTER_VM_BACKEND_DIR" >/dev/null
+
+        VM_ID=""
+        BACKEND_SIZE=""
+        read -r VM_ID BACKEND_SIZE <<< "$(sudo "$REGISTER_VM_BACKEND_BIN" "$TOTAL_VCPUS")" || true
+
+        if [[ -n "$VM_ID" && -n "$BACKEND_SIZE" ]]; then
+            # Minor 0 is reserved for the registry; per-VM backends start at 1.
+            HOSTBACKEND_DEVICE="/dev/host_ivshmem$((VM_ID + 1))"
+
+            IVSHMEM_QEMU_ARGS=(
+                -object "memory-backend-file,id=hostmem0,size=$BACKEND_SIZE,share=on,mem-path=$HOSTBACKEND_DEVICE"
+                -device "ivshmem-plain,memdev=hostmem0"
+            )
+            echo "ivshmem: registered VM_ID=$VM_ID, enabled host-backed shared memory via $HOSTBACKEND_DEVICE (size=$BACKEND_SIZE)"
+        else
+            echo "warning: failed to register VM with $HOST_REGISTRY_DEVICE, skipping ivshmem device" >&2
+        fi
     else
-        HOSTBACKEND_DEVICE=""
-        echo "warning: host_ivshmem is not ready (host backend device missing or module not loaded), skipping ivshmem device" >&2
+        echo "warning: host_ivshmem is not ready ($HOST_REGISTRY_DEVICE missing or module not loaded), skipping ivshmem device" >&2
     fi
 fi
 
@@ -200,18 +219,21 @@ else
     SEED_ISO_ARG=(-drive "file=$SEED_ISO,format=raw,if=virtio,readonly=on")
 fi
 
-# --- CPU topology ---
-TOTAL_VCPUS=$(( ARG_SOCKETS * ARG_CORES * ARG_THREADS ))
-CPU_TOPOLOGY="$TOTAL_VCPUS,sockets=$ARG_SOCKETS,cores=$ARG_CORES,threads=$ARG_THREADS"
-
 # --- QEMU command ---
+
+# --- Phantom-Tracker VM Registration ----
 
 
 #--vm qmp socket definition ----
 QMP_SOCKET="/tmp/${ARG_NAME}-qmp.sock"
 rm -f "$QMP_SOCKET"
 
-QEMU_CMD=(
+QEMU_CMD=()
+if [[ -n "$HOSTBACKEND_DEVICE" ]]; then
+    # /dev/host_ivshmem* is root-owned; qemu must run as root to open/mmap it.
+    QEMU_CMD+=(sudo)
+fi
+QEMU_CMD+=(
     qemu-system-x86_64
     -enable-kvm
     -cpu host

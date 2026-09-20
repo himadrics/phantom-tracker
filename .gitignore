@@ -48,6 +48,7 @@ user/register_vm
 pvsched-ebpf/host/h2g_msg_timer_loader
 test/h2g_read_test
 test/omp_test
+pvsched-shmem/host/usr/register_vm_backend
 
 # =========================
 # VM / images
