@@ -149,21 +149,25 @@ static int guest_ivshmem_release(struct inode *inode, struct file *file)
 			  overhead. The metadata page lands at offset 0 of the mapping
 			  and the H2G page immediately follows it.
  */
-int  guest_ivshmem_mmap(struct file * file, struct vm_area_struct * vma)
+
+
+int guest_ivshmem_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct guest_ivshmem_device *guest = file->private_data;
-	resource_size_t total_size = GUEST_IVSHMEM_METADATA_SIZE + guest->h2g_page_size;
-	int status;
+    struct guest_ivshmem_device *guest = file->private_data;
+    resource_size_t total_size = GUEST_IVSHMEM_METADATA_SIZE + guest->h2g_page_size;
+    resource_size_t offset = (resource_size_t) vma->vm_pgoff << PAGE_SHIFT;
+    resource_size_t len = vma_pages(vma) * PAGE_SIZE;
+    int status;
 
-	if (vma->vm_pgoff != 0 || vma_pages(vma) * PAGE_SIZE != total_size)
-		return -EINVAL;
+    if (offset >= total_size || len > total_size - offset)
+        return -EINVAL;
 
-	status  = remap_pfn_range(vma,
-							  vma->vm_start,
-							  guest->metadata_phy_page >> PAGE_SHIFT,
-							  total_size,
-							  vma->vm_page_prot);
-	return status;
+    status = remap_pfn_range(vma,
+                              vma->vm_start,
+                              (guest->metadata_phy_page + offset) >> PAGE_SHIFT,
+                              len,
+                              vma->vm_page_prot);
+    return status;
 }
 
 
