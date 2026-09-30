@@ -403,14 +403,9 @@ static int __init guest_ivshmem_init(void)
 		pr_err(GUEST_IVSHMEM_NAME
 		       ": failed to register BPF kfuncs: %d\n", ret);
 		goto err_unregister_pci_driver;
-	}
-
-	if (ret) {
-		pr_err(GUEST_IVSHMEM_NAME ": failed to register PCI driver: %d\n", ret);
-    goto err_unregister_pci_driver;
-  }
-	else
+	} else {
 		pr_info(GUEST_IVSHMEM_NAME ": loaded the PCI driver\n");
+	}
 
   return 0;
 
